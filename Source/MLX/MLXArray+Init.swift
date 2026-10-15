@@ -244,6 +244,17 @@ extension MLXArray {
         self.init(v_bfloat)
     }
 
+    /// Scalar ``DType/float16`` `MLXArray` from a `Float32`, rounded by MLX. Used where Swift's
+    /// `Float16` is compiled out (x86_64, where mlx-c defines `float16_t` only on ARM).
+    public convenience init(float16 value: Float32) {
+        let stream = StreamOrDevice.default
+        let v_mlx = mlx_array_new_float(Float32(value))
+        defer { mlx_array_free(v_mlx) }
+        var v_half = mlx_array_new()
+        mlx_astype(&v_half, v_mlx, DType.float16.cmlxDtype, stream.ctx)
+        self.init(v_half)
+    }
+
     /// Initializer allowing creation of scalar (0-dimension) `MLXArray` from a `HasDType` value
     /// with a conversion to a given ``DType``.
     ///
@@ -292,12 +303,12 @@ extension MLXArray {
                     self.init(Int32(v))
                 case .int64:
                     self.init(Int64(v))
-                #if !(arch(x86_64) && canImport(Darwin))
+                #if !arch(x86_64)
                     case .float16:
                         self.init(Float16(v))
                 #else
                     case .float16:
-                        fatalError("dtype \(dtype) not supported")
+                        self.init(float16: Float32(v))
                 #endif
                 case .float32:
                     self.init(Float32(v))
@@ -330,12 +341,12 @@ extension MLXArray {
                     self.init(Int32(v))
                 case .int64:
                     self.init(Int64(v))
-                #if !(arch(x86_64) && canImport(Darwin))
+                #if !arch(x86_64)
                     case .float16:
                         self.init(Float16(v))
                 #else
                     case .float16:
-                        fatalError("dtype \(dtype) not supported")
+                        self.init(float16: Float32(v))
                 #endif
                 case .float32:
                     self.init(Float32(v))
