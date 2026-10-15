@@ -87,3 +87,32 @@ index 09236f1da..ff414c6d6 100644
  TEST_CASE("test split") {
    array x = array(1);
    CHECK_THROWS(split(x, 0));
+diff --git a/mlx/backend/cuda/compiled.cpp b/mlx/backend/cuda/compiled.cpp
+index a363cf9c3..f5d395477 100644
+--- a/mlx/backend/cuda/compiled.cpp
++++ b/mlx/backend/cuda/compiled.cpp
+@@ -243,6 +243,10 @@ void Compiled::eval_gpu(
+     // Build source code.
+     cu::FusedKernelBuilder builder{
+         g_jit_includes, lib_name(), inputs_, outputs_, tape_, is_constant_};
++    // Fused elementwise kernels must round like the separate ops they
++    // replace; jit_module compiles sources carrying this marker without FMA
++    // contraction (a bf16 x * y + z otherwise skips the product's rounding).
++    builder.os += "// mlx-jit: no-fmad\n";
+     builder.os +=
+         "namespace mlx::core::cu {\n\n"
+         "namespace cg = cooperative_groups;\n\n";
+diff --git a/mlx/backend/cuda/jit_module.cpp b/mlx/backend/cuda/jit_module.cpp
+index 0d107a8e1..9be062da2 100644
+--- a/mlx/backend/cuda/jit_module.cpp
++++ b/mlx/backend/cuda/jit_module.cpp
+@@ -343,6 +343,9 @@ void compile(
+   for (const auto& include : include_path_args()) {
+     args.push_back(include.c_str());
+   }
++  if (source.find("// mlx-jit: no-fmad") != std::string::npos) {
++    args.push_back("--fmad=false");
++  }
+ 
+   // Compile program.
+   nvrtcResult compile_result =
