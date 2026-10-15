@@ -47,6 +47,10 @@ set(apply_patch_script -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/apply-patch.cmake)
 #   runtime's own teardown. A failing destroy there terminated the process.
 set(mlx_patch
     ${apply_patch} -DPATCH=${CMAKE_CURRENT_SOURCE_DIR}/cmake/mlx.patch
+    ${apply_patch_script}
+    # uncomfy fork: split data_size span fix + separate conv TF32 switch (see the
+    # header of cmake/mlx-uncomfy.patch)
+    COMMAND ${apply_patch} -DPATCH=${CMAKE_CURRENT_SOURCE_DIR}/cmake/mlx-uncomfy.patch
     ${apply_patch_script})
 
 # note: this must be declared (and named `mlx`) before mlx-c is made available
