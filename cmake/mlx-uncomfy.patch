@@ -56,10 +56,10 @@ index 9e471d235..4dbc3bf38 100644
    }
    CHECK_CUDNN_ERROR(graph.build());
 diff --git a/tests/ops_tests.cpp b/tests/ops_tests.cpp
-index 09236f1da..dce19acf2 100644
+index 09236f1da..ff414c6d6 100644
 --- a/tests/ops_tests.cpp
 +++ b/tests/ops_tests.cpp
-@@ -527,6 +527,26 @@ TEST_CASE("test dynamic slice update") {
+@@ -527,6 +527,27 @@ TEST_CASE("test dynamic slice update") {
    CHECK(array_equal(out, expected).item<bool>());
  }
  
@@ -70,7 +70,8 @@ index 09236f1da..dce19acf2 100644
 +  auto x = reshape(arange(24), {4, 6});
 +  auto parts = split(x, 2, 1);
 +  auto sl = slice(x, {0, 3}, {4, 6});
-+  eval(parts, sl);
++  eval(parts);
++  eval(sl);
 +  CHECK_EQ(sl.data_size(), 21); // (4 - 1) * 6 + 3
 +  CHECK_EQ(parts[0].data_size(), 21);
 +  CHECK_EQ(parts[1].data_size(), 21);
