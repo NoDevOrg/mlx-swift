@@ -142,7 +142,7 @@ public enum DType: Hashable, Sendable, CaseIterable {
         /// In Swift this is e.g. `Double.ulpOfOne`
         public var eps: Double {
             switch dtype {
-            #if !arch(x86_64)
+            #if !(arch(x86_64) && canImport(Darwin))
                 case .float16: Double(Float16.ulpOfOne)
             #else
                 case .float16: 0x1p-10  // 2^-10
@@ -160,7 +160,7 @@ public enum DType: Hashable, Sendable, CaseIterable {
         /// The largest representable number
         public var max: Double {
             switch dtype {
-            #if !arch(x86_64)
+            #if !(arch(x86_64) && canImport(Darwin))
                 case .float16: Double(Float16.greatestFiniteMagnitude)
             #else
                 case .float16: 0x1.FFCp15  // 65504
@@ -175,7 +175,7 @@ public enum DType: Hashable, Sendable, CaseIterable {
         /// Return the value for the smallest normal
         public var smallestNormal: Double {
             switch dtype {
-            #if !arch(x86_64)
+            #if !(arch(x86_64) && canImport(Darwin))
                 case .float16: Double(Float16.leastNormalMagnitude)
             #else
                 case .float16: 0x1p-14  // 2^-14
@@ -190,7 +190,7 @@ public enum DType: Hashable, Sendable, CaseIterable {
         /// The smallest positive floating point number with 0 as leading bit in the mantissa following IEEE-754
         public var smallestSubnormal: Double {
             switch dtype {
-            #if !arch(x86_64)
+            #if !(arch(x86_64) && canImport(Darwin))
                 case .float16: Double(Float16.leastNonzeroMagnitude)
             #else
                 case .float16: 0x1p-24  // 2^-24
@@ -324,7 +324,7 @@ extension UInt: HasDType {
     }
 }
 
-#if !arch(x86_64)
+#if !(arch(x86_64) && canImport(Darwin))
     extension Float16: HasDType {
         static public var dtype: DType { .float16 }
 

@@ -64,7 +64,7 @@ extension UInt16: NestedArrayElement {}
 extension UInt32: NestedArrayElement {}
 extension UInt64: NestedArrayElement {}
 extension UInt: NestedArrayElement {}
-#if !arch(x86_64)
+#if !(arch(x86_64) && canImport(Darwin))
     extension Float16: NestedArrayElement {}
 #endif
 extension Float32: NestedArrayElement {}

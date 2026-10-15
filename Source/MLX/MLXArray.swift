@@ -272,7 +272,7 @@ public final class MLXArray {
         eval()
 
         switch self.dtype {
-        #if !arch(x86_64)
+        #if !(arch(x86_64) && canImport(Darwin))
             case .float16:
                 var r: Float16 = 0
                 mlx_array_item_float16(&r, self.ctx)
@@ -297,7 +297,7 @@ public final class MLXArray {
         eval()
 
         switch self.dtype {
-        #if !arch(x86_64)
+        #if !(arch(x86_64) && canImport(Darwin))
             case .float16:
                 var r: Float16 = 0
                 mlx_array_item_float16(&r, self.ctx)
@@ -363,7 +363,7 @@ public final class MLXArray {
                     break
                 }
             }
-        #if !arch(x86_64)
+        #if !(arch(x86_64) && canImport(Darwin))
             case is Float.Type, is Float32.Type, is Float16.Type, is Double.Type:
                 switch self.dtype {
                 case .float16, .float32, .float64:
@@ -430,7 +430,7 @@ public final class MLXArray {
             var r: Int64 = 0
             mlx_array_item_int64(&r, self.ctx)
             return Int(r) as! T
-        #if !arch(x86_64)
+        #if !(arch(x86_64) && canImport(Darwin))
             case is Float16.Type:
                 var r: Float16 = 0
                 mlx_array_item_float16(&r, self.ctx)

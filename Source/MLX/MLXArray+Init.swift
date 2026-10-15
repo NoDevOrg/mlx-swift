@@ -292,7 +292,7 @@ extension MLXArray {
                     self.init(Int32(v))
                 case .int64:
                     self.init(Int64(v))
-                #if !arch(x86_64)
+                #if !(arch(x86_64) && canImport(Darwin))
                     case .float16:
                         self.init(Float16(v))
                 #else
@@ -330,7 +330,7 @@ extension MLXArray {
                     self.init(Int32(v))
                 case .int64:
                     self.init(Int64(v))
-                #if !arch(x86_64)
+                #if !(arch(x86_64) && canImport(Darwin))
                     case .float16:
                         self.init(Float16(v))
                 #else
