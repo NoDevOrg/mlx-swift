@@ -1,6 +1,7 @@
 [submodule "submodules/mlx"]
 	path = Source/Cmlx/mlx
-	url = https://github.com/ml-explore/mlx
+	url = https://github.com/NoDevOrg/mlx
+	branch = uncomfy/split-data-size
 [submodule "submodules/mlx-c"]
 	path = Source/Cmlx/mlx-c
 	url = https://github.com/ml-explore/mlx-c
