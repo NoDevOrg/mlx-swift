@@ -3,6 +3,7 @@
 #  - cuDNN convs follow MLX_CONV_ENABLE_TF32 instead of MLX_ENABLE_TF32
 #  - fused elementwise kernels compile without FMA contraction
 #  - MLX_JIT_KERNEL_INFO / MLX_JIT_DUMP_DIR: register counts and cubin dumps of JIT kernels
+#  - custom CUDA kernels use the on-disk compile cache
 diff --git a/mlx/backend/common/common.cpp b/mlx/backend/common/common.cpp
 index 5426301a3..8ea71cf7c 100644
 --- a/mlx/backend/common/common.cpp
@@ -72,6 +73,22 @@ index 9e471d235..4dbc3bf38 100644
      graph.deselect_numeric_notes({fe::NumericalNote_t::TENSOR_CORE});
    }
    CHECK_CUDNN_ERROR(graph.build());
+diff --git a/mlx/backend/cuda/custom_kernel.cpp b/mlx/backend/cuda/custom_kernel.cpp
+index c230656d8..5a68951f1 100644
+--- a/mlx/backend/cuda/custom_kernel.cpp
++++ b/mlx/backend/cuda/custom_kernel.cpp
+@@ -319,7 +319,10 @@ void CustomKernel::eval_gpu(
+         return std::make_tuple(
+             is_precompiled_, source_, std::vector{kernel_name});
+       },
+-      false);
++      // The module name hashes the full generated source (header, signature,
++      // template constants, body), so the on-disk cache can't serve a stale
++      // kernel. Without it every process recompiles every custom kernel.
++      true);
+ 
+   // Make the arguments
+   cu::KernelArgs args;
 diff --git a/mlx/backend/cuda/jit_module.cpp b/mlx/backend/cuda/jit_module.cpp
 index 0d107a8e1..6740f862d 100644
 --- a/mlx/backend/cuda/jit_module.cpp
