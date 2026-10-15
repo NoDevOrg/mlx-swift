@@ -1,6 +1,8 @@
 # uncomfy patches on mlx v0.32.2 (branch fix-split-data-size of the Source/Cmlx/mlx submodule):
 #  - Split reports its buffer span as data_size (fixes 32-bit indexing of large strided splits on CUDA)
 #  - cuDNN convs follow MLX_CONV_ENABLE_TF32 instead of MLX_ENABLE_TF32
+#  - fused elementwise kernels compile without FMA contraction
+#  - MLX_JIT_KERNEL_INFO / MLX_JIT_DUMP_DIR: register counts and cubin dumps of JIT kernels
 diff --git a/mlx/backend/common/common.cpp b/mlx/backend/common/common.cpp
 index 5426301a3..8ea71cf7c 100644
 --- a/mlx/backend/common/common.cpp
@@ -42,6 +44,21 @@ index 5426301a3..8ea71cf7c 100644
    };
  
    std::vector<int> indices(1, 0);
+diff --git a/mlx/backend/cuda/compiled.cpp b/mlx/backend/cuda/compiled.cpp
+index a363cf9c3..f5d395477 100644
+--- a/mlx/backend/cuda/compiled.cpp
++++ b/mlx/backend/cuda/compiled.cpp
+@@ -243,6 +243,10 @@ void Compiled::eval_gpu(
+     // Build source code.
+     cu::FusedKernelBuilder builder{
+         g_jit_includes, lib_name(), inputs_, outputs_, tape_, is_constant_};
++    // Fused elementwise kernels must round like the separate ops they
++    // replace; jit_module compiles sources carrying this marker without FMA
++    // contraction (a bf16 x * y + z otherwise skips the product's rounding).
++    builder.os += "// mlx-jit: no-fmad\n";
+     builder.os +=
+         "namespace mlx::core::cu {\n\n"
+         "namespace cg = cooperative_groups;\n\n";
 diff --git a/mlx/backend/cuda/conv.cpp b/mlx/backend/cuda/conv.cpp
 index 9e471d235..4dbc3bf38 100644
 --- a/mlx/backend/cuda/conv.cpp
@@ -55,6 +72,63 @@ index 9e471d235..4dbc3bf38 100644
      graph.deselect_numeric_notes({fe::NumericalNote_t::TENSOR_CORE});
    }
    CHECK_CUDNN_ERROR(graph.build());
+diff --git a/mlx/backend/cuda/jit_module.cpp b/mlx/backend/cuda/jit_module.cpp
+index 0d107a8e1..6740f862d 100644
+--- a/mlx/backend/cuda/jit_module.cpp
++++ b/mlx/backend/cuda/jit_module.cpp
+@@ -343,6 +343,9 @@ void compile(
+   for (const auto& include : include_path_args()) {
+     args.push_back(include.c_str());
+   }
++  if (source.find("// mlx-jit: no-fmad") != std::string::npos) {
++    args.push_back("--fmad=false");
++  }
+ 
+   // Compile program.
+   nvrtcResult compile_result =
+@@ -429,6 +432,15 @@ JitModule::JitModule(
+       }
+     } else {
+       compile(device, module_name, source_code, kernel_names, ptx, ptx_kernels);
++      // MLX_JIT_DUMP_DIR=<dir> writes each compiled module's source and its
++      // cubin (or PTX) there, for cuobjdump -sass.
++      if (auto dir = std::getenv("MLX_JIT_DUMP_DIR"); dir) {
++        auto base = std::filesystem::path(dir) / module_name.substr(0, 200);
++        bool elf = ptx.size() > 4 && ptx.compare(0, 4, "\x7f" "ELF") == 0;
++        std::ofstream(base.string() + (elf ? ".cubin" : ".ptx"), std::ios::binary)
++            .write(ptx.data(), ptx.size());
++        std::ofstream(base.string() + ".cu") << source_code;
++      }
+     }
+ 
+     // If requested save them in the file cache for the next launch
+@@ -440,6 +452,26 @@ JitModule::JitModule(
+ 
+   // Load the module
+   load_module(module_name, ptx, ptx_kernels, module_, kernels_);
++
++  // MLX_JIT_KERNEL_INFO=1 prints each loaded kernel's registers, local
++  // (spill) memory and static shared memory, to check register pressure.
++  if (std::getenv("MLX_JIT_KERNEL_INFO")) {
++    for (const auto& [name, k] : kernels_) {
++      int regs = 0, local = 0, shared = 0;
++      cuFuncGetAttribute(&regs, CU_FUNC_ATTRIBUTE_NUM_REGS, std::get<0>(k));
++      cuFuncGetAttribute(
++          &local, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, std::get<0>(k));
++      cuFuncGetAttribute(
++          &shared, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, std::get<0>(k));
++      fmt::print(
++          stderr,
++          "mlx jit kernel {}: {} registers, {} B local, {} B static shared\n",
++          name,
++          regs,
++          local,
++          shared);
++    }
++  }
+ }
+ 
+ JitModule::~JitModule() {
 diff --git a/tests/ops_tests.cpp b/tests/ops_tests.cpp
 index 09236f1da..ff414c6d6 100644
 --- a/tests/ops_tests.cpp
@@ -87,32 +161,3 @@ index 09236f1da..ff414c6d6 100644
  TEST_CASE("test split") {
    array x = array(1);
    CHECK_THROWS(split(x, 0));
-diff --git a/mlx/backend/cuda/compiled.cpp b/mlx/backend/cuda/compiled.cpp
-index a363cf9c3..f5d395477 100644
---- a/mlx/backend/cuda/compiled.cpp
-+++ b/mlx/backend/cuda/compiled.cpp
-@@ -243,6 +243,10 @@ void Compiled::eval_gpu(
-     // Build source code.
-     cu::FusedKernelBuilder builder{
-         g_jit_includes, lib_name(), inputs_, outputs_, tape_, is_constant_};
-+    // Fused elementwise kernels must round like the separate ops they
-+    // replace; jit_module compiles sources carrying this marker without FMA
-+    // contraction (a bf16 x * y + z otherwise skips the product's rounding).
-+    builder.os += "// mlx-jit: no-fmad\n";
-     builder.os +=
-         "namespace mlx::core::cu {\n\n"
-         "namespace cg = cooperative_groups;\n\n";
-diff --git a/mlx/backend/cuda/jit_module.cpp b/mlx/backend/cuda/jit_module.cpp
-index 0d107a8e1..9be062da2 100644
---- a/mlx/backend/cuda/jit_module.cpp
-+++ b/mlx/backend/cuda/jit_module.cpp
-@@ -343,6 +343,9 @@ void compile(
-   for (const auto& include : include_path_args()) {
-     args.push_back(include.c_str());
-   }
-+  if (source.find("// mlx-jit: no-fmad") != std::string::npos) {
-+    args.push_back("--fmad=false");
-+  }
- 
-   // Compile program.
-   nvrtcResult compile_result =
