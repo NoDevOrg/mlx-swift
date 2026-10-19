@@ -5,6 +5,7 @@
 #  - MLX_JIT_KERNEL_INFO / MLX_JIT_DUMP_DIR: register counts and cubin dumps of JIT kernels
 #  - custom CUDA kernels use the on-disk compile cache
 #  - f32 matmuls time cuBLASLt's candidates once per shape (MLX_CUBLASLT_AUTOTUNE)
+#  - CUDA allocator: when the memory pool refuses to grow (GB10, with memory free), fall back to managed memory
 diff --git a/mlx/backend/common/common.cpp b/mlx/backend/common/common.cpp
 index 5426301a3..8ea71cf7c 100644
 --- a/mlx/backend/common/common.cpp
@@ -436,3 +437,25 @@ index 09236f1da..ff414c6d6 100644
  TEST_CASE("test split") {
    array x = array(1);
    CHECK_THROWS(split(x, 0));
+diff --git a/mlx/backend/cuda/allocator.cpp b/mlx/backend/cuda/allocator.cpp
+index b04d72da0..c42d345b4 100644
+--- a/mlx/backend/cuda/allocator.cpp
++++ b/mlx/backend/cuda/allocator.cpp
+@@ -203,7 +203,16 @@ CudaAllocator::malloc_async(size_t size, int device, cudaStream_t stream) {
+       } else {
+         cu::device(device).make_current();
+         if (mem_pools_[device]) { // supports memory pools
+-          CHECK_CUDA_ERROR(cudaMallocAsync(&data, size, stream));
++          cudaError_t err = cudaMallocAsync(&data, size, stream);
++          // On GB10 the pool can refuse to grow while memory is free; use
++          // managed memory then (freed with cudaFree, as device -1).
++          if (err == cudaErrorMemoryAllocation) {
++            cudaGetLastError();
++            data = unified_malloc(size);
++            device = -1;
++            err = cudaSuccess;
++          }
++          CHECK_CUDA_ERROR(err);
+         } else {
+           CHECK_CUDA_ERROR(cudaMalloc(&data, size));
+         }
