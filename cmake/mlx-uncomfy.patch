@@ -6,6 +6,7 @@
 #  - custom CUDA kernels use the on-disk compile cache
 #  - f32 matmuls time cuBLASLt's candidates once per shape (MLX_CUBLASLT_AUTOTUNE)
 #  - CUDA allocator: when the memory pool refuses to grow (GB10, with memory free), fall back to managed memory
+#  - Linux file reads: 16 threads at 4 MB, page cache then O_DIRECT, tested per filesystem at first use (MLX_PARALLEL_READS=auto|direct|buffered|off)
 diff --git a/mlx/backend/common/common.cpp b/mlx/backend/common/common.cpp
 index 5426301a3..8ea71cf7c 100644
 --- a/mlx/backend/common/common.cpp
@@ -459,3 +460,309 @@ index b04d72da0..c42d345b4 100644
          } else {
            CHECK_CUDA_ERROR(cudaMalloc(&data, size));
          }
+diff --git a/mlx/io/load.cpp b/mlx/io/load.cpp
+index a9379c307..e16fbb89f 100644
+--- a/mlx/io/load.cpp
++++ b/mlx/io/load.cpp
+@@ -10,6 +10,15 @@
+ #include <windows.h>
+ #endif // _WIN32
+ 
++#ifdef __linux__
++#include <sys/uio.h>
++#include <cerrno>
++#include <chrono>
++#include <cstdlib>
++#include <iostream>
++#include <unordered_map>
++#endif // __linux__
++
+ #include "mlx/backend/cuda/cuda.h"
+ #include "mlx/io.h"
+ #include "mlx/io/load.h"
+@@ -334,6 +343,230 @@ array load(std::string file, StreamOrDevice s) {
+ 
+ namespace io {
+ 
++#ifdef __linux__
++namespace {
++
++// Load::eval_cpu reads at most 4 tensors at once, and most tensors are under
++// 128 MB, so a 32 MB split gets little parallelism however many threads there are.
++constexpr size_t chunk_size = 1 << 22;
++constexpr size_t chunk_threads = 16;
++constexpr size_t direct_align = 4096;
++// Below this a file loads fast anyway, so direct reads aren't worth its pages.
++constexpr size_t min_direct_file = size_t(1) << 28;
++// Buffered reads at chunk_size reach about 3.5 GB/s on the GB10's NVMe and keep
++// the pages for the next load. A disk slower than this gains too little from
++// direct reads to give that up, and a network volume needs its cache more.
++constexpr double min_direct_gb_per_s = 3.0;
++
++enum class ReadMode { automatic, direct, buffered, off };
++
++ReadMode read_mode() {
++  static const ReadMode mode = [] {
++    const char* env = std::getenv("MLX_PARALLEL_READS");
++    std::string v = env ? env : "auto";
++    if (v == "auto") {
++      return ReadMode::automatic;
++    } else if (v == "direct") {
++      return ReadMode::direct;
++    } else if (v == "buffered") {
++      return ReadMode::buffered;
++    } else if (v == "off") {
++      return ReadMode::off;
++    }
++    std::cerr << "[mlx] MLX_PARALLEL_READS=" << v << " is not one of auto, "
++              << "direct, buffered, off; using auto" << std::endl;
++    return ReadMode::automatic;
++  }();
++  return mode;
++}
++
++// Separate from io::thread_pool(): Load::eval_cpu runs read() on that pool,
++// where it blocks on these chunks. One shared pool would deadlock.
++ThreadPool& chunk_pool() {
++  // Leak - see Scheduler singleton comment in scheduler.cpp.
++  static ThreadPool* pool = new ThreadPool{chunk_threads};
++  return *pool;
++}
++
++// O_DIRECT needs aligned memory, and the destination may be CUDA managed memory
++// that must not be pinned for DMA, so direct reads always land here first.
++constexpr size_t staging_size = chunk_size + 2 * direct_align;
++char* staging() {
++  thread_local std::unique_ptr<void, decltype(&std::free)> buffer{
++      nullptr, &std::free};
++  if (!buffer) {
++    void* p = nullptr;
++    if (posix_memalign(&p, direct_align, staging_size) != 0) {
++      return nullptr;
++    }
++    buffer.reset(p);
++  }
++  return static_cast<char*>(buffer.get());
++}
++
++// Reads up to n bytes through staging and returns how many arrived. Fewer than
++// n means an error or the end of the file. The caller decides which.
++size_t read_direct(int fd, char* data, size_t n, size_t offset) {
++  char* stage = staging();
++  if (stage == nullptr) {
++    return 0;
++  }
++  size_t done = 0;
++  while (done < n) {
++    size_t at = offset + done;
++    size_t base = at & ~(direct_align - 1);
++    size_t skip = at - base;
++    size_t want = (skip + (n - done) + direct_align - 1) & ~(direct_align - 1);
++    auto m = pread(fd, stage, std::min(want, staging_size), base);
++    if (m <= 0 || static_cast<size_t>(m) <= skip) {
++      break;
++    }
++    size_t got = std::min(static_cast<size_t>(m) - skip, n - done);
++    std::memcpy(data + done, stage + skip, got);
++    done += got;
++  }
++  return done;
++}
++
++// Whether direct reads of this filesystem are possible and worth it, measured
++// once per filesystem. The sample is spaced through the file. The first round
++// warms the pool and staging, then either of two timed rounds can pass, so a
++// moment of contention doesn't decide for the life of the process.
++bool direct_worthwhile(
++    int fd,
++    dev_t device,
++    size_t file_size,
++    const std::string& label) {
++  static std::mutex mutex;
++  static auto& verdicts = *new std::unordered_map<dev_t, bool>();
++  std::lock_guard<std::mutex> lock(mutex);
++  if (auto it = verdicts.find(device); it != verdicts.end()) {
++    return it->second;
++  }
++  constexpr int rounds = 3;
++  size_t spacing = file_size / (chunk_threads * rounds);
++  double best = 0;
++  bool works = true;
++  for (int round = 0; round < rounds && works; round++) {
++    auto start = std::chrono::steady_clock::now();
++    std::vector<std::future<bool>> reads;
++    for (size_t i = 0; i < chunk_threads; i++) {
++      size_t at = ((i * rounds + round) * spacing) & ~(direct_align - 1);
++      reads.emplace_back(chunk_pool().enqueue([fd, at]() {
++        char* stage = staging();
++        return stage != nullptr &&
++            pread(fd, stage, chunk_size, at) ==
++            static_cast<ssize_t>(chunk_size);
++      }));
++    }
++    for (auto& r : reads) {
++      works = r.get() && works;
++    }
++    std::chrono::duration<double> took =
++        std::chrono::steady_clock::now() - start;
++    if (round > 0) {
++      best = std::max(best, chunk_threads * chunk_size / 1e9 / took.count());
++      if (best >= min_direct_gb_per_s) {
++        break;
++      }
++    }
++  }
++  bool verdict = works && best >= min_direct_gb_per_s;
++  std::cerr << "[mlx] direct read test on " << label << ": ";
++  if (works) {
++    std::cerr << best << " GB/s, ";
++  } else {
++    std::cerr << "reads failed, ";
++  }
++  std::cerr << (verdict ? "using direct reads" : "using buffered reads")
++            << std::endl;
++  verdicts[device] = verdict;
++  return verdict;
++}
++
++} // namespace
++
++void ParallelFileReader::setup_direct() {
++  if (read_mode() == ReadMode::buffered) {
++    return;
++  }
++  bool forced = read_mode() == ReadMode::direct;
++  struct stat st;
++  if (fstat(fd_, &st) != 0 ||
++      (!forced && static_cast<size_t>(st.st_size) < min_direct_file)) {
++    return;
++  }
++  // Through /proc so it's fd_'s inode, even if a download has since replaced
++  // the file by rename. Two paths to two files would read wrong bytes silently.
++  std::string self = "/proc/self/fd/" + std::to_string(fd_);
++  direct_fd_ = open(self.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
++  if (direct_fd_ < 0) {
++    std::cerr << "[mlx] " << label() << " can't open for direct reads ("
++              << std::strerror(errno) << "), using buffered reads" << std::endl;
++    return;
++  }
++  direct_on_ = forced ||
++      direct_worthwhile(direct_fd_, st.st_dev, st.st_size, label());
++}
++
++// The page cache first, so cached bytes stay cheap, then direct for the misses,
++// then buffered for whatever direct couldn't do. Only a buffered failure counts.
++bool ParallelFileReader::read_chunk(char* data, size_t n, size_t offset) {
++  if (direct_on_) {
++    if (nowait_on_) {
++      iovec v{data, n};
++      auto m = preadv2(fd_, &v, 1, offset, RWF_NOWAIT);
++      if (m > 0) {
++        data += m;
++        n -= m;
++        offset += m;
++      } else if (m < 0 && errno != EAGAIN) {
++        nowait_on_ = false;
++      }
++    }
++    if (n != 0) {
++      size_t m = read_direct(direct_fd_, data, n, offset);
++      data += m;
++      n -= m;
++      offset += m;
++      if (n != 0 && direct_on_.exchange(false)) {
++        std::cerr << "[mlx] direct read of " << label() << " stopped at "
++                  << offset << ", using buffered reads" << std::endl;
++      }
++    }
++  }
++  while (n != 0) {
++    auto m = pread(fd_, data, n, offset);
++    if (m <= 0) {
++      return false;
++    }
++    data += m;
++    n -= m;
++    offset += m;
++  }
++  return true;
++}
++
++void ParallelFileReader::read_chunked(char* data, size_t n, size_t offset) {
++  std::call_once(direct_once_, [this] { setup_direct(); });
++  std::vector<std::future<bool>> futs;
++  while (n >= chunk_size) {
++    futs.emplace_back(chunk_pool().enqueue(
++        [this, data, offset] { return read_chunk(data, chunk_size, offset); }));
++    data += chunk_size;
++    n -= chunk_size;
++    offset += chunk_size;
++  }
++  bool ok = n == 0 || read_chunk(data, n, offset);
++  for (auto& f : futs) {
++    ok = f.get() && ok;
++  }
++  if (!ok) {
++    throw std::runtime_error("[read] Unable to read from file.");
++  }
++}
++#endif // __linux__
++
+ ThreadPool& thread_pool() {
+   // Leak - see Scheduler singleton comment in scheduler.cpp.
+   static ThreadPool* pool_ = new ThreadPool{4};
+@@ -360,6 +593,12 @@ void ParallelFileReader::read(char* data, size_t n) {
+ }
+ 
+ void ParallelFileReader::read(char* data, size_t n, size_t offset) {
++#ifdef __linux__
++  if (read_mode() != ReadMode::off) {
++    read_chunked(data, n, offset);
++    return;
++  }
++#endif
+   auto readfn = [fd = fd_](size_t offset, size_t size, char* buffer) -> bool {
+     while (size != 0) {
+       auto m = pread(fd, buffer, size, offset);
+diff --git a/mlx/io/load.h b/mlx/io/load.h
+index 2e13efe11..fd0dd1ad0 100644
+--- a/mlx/io/load.h
++++ b/mlx/io/load.h
+@@ -2,7 +2,9 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <memory>
++#include <mutex>
+ #include <sstream>
+ 
+ #include <fcntl.h>
+@@ -64,6 +66,11 @@ class ParallelFileReader : public Reader {
+ 
+   ~ParallelFileReader() override {
+     close(fd_);
++#ifdef __linux__
++    if (direct_fd_ >= 0) {
++      close(direct_fd_);
++    }
++#endif
+   }
+ 
+   bool is_open() const override {
+@@ -106,6 +113,15 @@ class ParallelFileReader : public Reader {
+   static ThreadPool& thread_pool();
+   int fd_;
+   std::string label_;
++#ifdef __linux__
++  void read_chunked(char* data, size_t n, size_t offset);
++  bool read_chunk(char* data, size_t n, size_t offset);
++  void setup_direct();
++  std::once_flag direct_once_;
++  int direct_fd_{-1};
++  std::atomic<bool> direct_on_{false};
++  std::atomic<bool> nowait_on_{true};
++#endif
+ };
+ 
+ class FileWriter : public Writer {
